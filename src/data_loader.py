@@ -123,13 +123,16 @@ def load_vehicles(cfg: dict) -> pd.DataFrame:
     df = _normalize_columns(pd.read_csv(path))
 
     col_type = _find_column(df, ["Vehicle Type", "vehicle_type", "type"], "Vehicle Type")
-    col_phy = _find_column(df, ["Phy Cap (kg)", "Phy Cap", "phy_cap_kg"], "Phy Cap (kg)")
-    col_vol = _find_column(df, ["Vol Cap (kg)", "Vol Cap", "vol_cap_kg"], "Vol Cap (kg)")
+    col_phy = _find_column(
+        df, ["Phy Cap(Kgs)", "Phy Cap (kg)", "Phy Cap", "phy_cap_kg"], "Phy Cap(Kgs)")
+    col_vol = _find_column(
+        df, ["Vol Cap(Kgs)", "Vol Cap (kg)", "Vol Cap", "vol_cap_kg"], "Vol Cap(Kgs)")
     col_fixed = _find_column(df, ["Fixed cost", "fixed_cost"], "Fixed cost")
     col_perkm = _find_column(df, ["Per KM cost (Fixed)", "Per-km cost", "per_km_cost"],
                               "Per KM cost (Fixed)")
-    col_limit = _find_column(df, ["Round-trip km limit", "round_trip_km_limit"],
-                              "Round-trip km limit")
+    col_limit = _find_column(
+        df, ["Round Trip KM Range", "Round-trip km limit", "round_trip_km_limit"],
+        "Round Trip KM Range")
 
     out = pd.DataFrame({
         "vehicle_type": df[col_type].astype(str).str.strip(),
@@ -144,38 +147,52 @@ def load_vehicles(cfg: dict) -> pd.DataFrame:
     out["round_trip_km_limit"] = limit_num.where(
         ~limit_raw.isin(["unbounded", "", "-", "nan", "none"]), other=pd.NA
     )
+
+    # Bonus column present in the real file but not documented in the
+    # problem statement (Section 5, C4 states a flat cap of 4 for every
+    # type). If present, surface it so constraints.py can use a
+    # per-vehicle-type cap instead of a single global constant, in case
+    # it differs from 4 for some types.
+    try:
+        col_stops = _find_column(
+            df, ["max_intermediate_stops", "max intermediate stops"],
+            "max_intermediate_stops")
+        out["max_intermediate_stops"] = pd.to_numeric(df[col_stops], errors="coerce")
+    except ValueError:
+        out["max_intermediate_stops"] = pd.NA  # not present -> caller falls back to config default
+
     return out
 
 
 def load_hop_costs(cfg: dict) -> pd.DataFrame:
+    """Per guidance: ignore the Period column entirely. The CPK file's
+    node coverage is scattered across different Period labels rather than
+    being period-varying rates for the same node, so hop cost is treated
+    as a flat per-node rate regardless of month."""
     path = _raw_path(cfg, "hop_cost_file")
     df = _normalize_columns(pd.read_csv(path))
 
     col_loc = _find_column(df, ["Location", "node"], "Location")
     col_cpk = _find_column(df, ["CPK", "cpk"], "CPK")
-    # Period is currently assumed constant for the horizon (single-month file);
-    # if it varies, downstream code will need a date-aware lookup. Flag if
-    # multiple periods are present so this assumption doesn't fail silently.
-    try:
-        col_period = _find_column(df, ["Period", "period"], "Period")
-        n_periods = df[col_period].nunique()
-        if n_periods > 1:
-            raise ValueError(
-                f"{path} has {n_periods} distinct values in '{col_period}' — "
-                f"hop cost may vary by period, but hop_cost_df is currently "
-                f"treated as static for the whole horizon. Confirm whether "
-                f"CPK should be looked up by date before proceeding."
-            )
-    except ValueError as e:
-        if "Could not find a column" in str(e):
-            pass  # no Period column at all -> nothing to check, fine
-        else:
-            raise
 
     out = pd.DataFrame({
         "node": df[col_loc].astype(str).str.strip(),
         "cpk": pd.to_numeric(df[col_cpk], errors="coerce"),
     })
+
+    # If the same node appears more than once (e.g. under different Period
+    # labels) with DIFFERENT CPK values, that's worth knowing about rather
+    # than silently keeping whichever row happens to come first.
+    dupes = out.groupby("node")["cpk"].nunique()
+    conflicting = dupes[dupes > 1]
+    if not conflicting.empty:
+        print(
+            f"WARNING: {path} has multiple different CPK values for the "
+            f"same node (period ignored per guidance): "
+            f"{conflicting.index.tolist()}. Keeping the first value seen "
+            f"per node — review data/raw for these nodes if that's wrong."
+        )
+
     return out.drop_duplicates(subset="node", keep="first")
 
 

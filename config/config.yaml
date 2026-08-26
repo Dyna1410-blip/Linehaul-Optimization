@@ -14,7 +14,7 @@ paths:
   demand_file: "monthly_clustered_loads_combined.csv"
   node_file: "node_processing_120.csv"
   distance_file: "one_to_all_distance_matrix_full.csv"
-  vehicle_file: "vehicle_data_full.csv"
+  vehicle_file: "vehicle_data_full copy.csv"
   hop_cost_file: "B2B Loader CPK Working March-26.csv"
   one_way_lane_file: "one_way_lane.xlsx"
 
