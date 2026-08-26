@@ -1,0 +1,68 @@
+# Mirrors vehicle_data_full.csv — kept here for quick reference/edits without touching raw data.
+# phy_cap_kg / vol_cap_kg = C1. round_trip_km_limit = C3 (unbounded == 32 FT types).
+
+vehicle_types:
+  - name: "32 FT (Multi Axle)"
+    phy_cap_kg: 18000
+    vol_cap_kg: 12920
+    fixed_cost: 3364
+    per_km_cost: 33.17
+    round_trip_km_limit: null   # unbounded
+
+  - name: "32 FT Single Axle (9-MT)"
+    phy_cap_kg: 9500
+    vol_cap_kg: 12920
+    fixed_cost: 2515
+    per_km_cost: 30.80
+    round_trip_km_limit: null   # unbounded
+
+  - name: "24 FT"
+    phy_cap_kg: 6500
+    vol_cap_kg: 7680
+    fixed_cost: 1711
+    per_km_cost: 26.92
+    round_trip_km_limit: 2000
+
+  - name: "22 FT"
+    phy_cap_kg: 6500
+    vol_cap_kg: 7013
+    fixed_cost: 1604
+    per_km_cost: 25.55
+    round_trip_km_limit: 2000
+
+  - name: "20 FT"
+    phy_cap_kg: 6000
+    vol_cap_kg: 6773
+    fixed_cost: 1489
+    per_km_cost: 24.41
+    round_trip_km_limit: 2000
+
+  - name: "17 FT"
+    phy_cap_kg: 5000
+    vol_cap_kg: 4463
+    fixed_cost: 1145
+    per_km_cost: 18.70
+    round_trip_km_limit: 1000
+
+  - name: "14 FT"
+    phy_cap_kg: 3500
+    vol_cap_kg: 3528
+    fixed_cost: 977
+    per_km_cost: 17.03
+    round_trip_km_limit: 1000
+
+  - name: "10 FT"
+    phy_cap_kg: 2500
+    vol_cap_kg: 2205
+    fixed_cost: 769
+    per_km_cost: 15.91
+    round_trip_km_limit: 800
+
+  - name: "Mahindra Pickup"
+    phy_cap_kg: 1200
+    vol_cap_kg: 1472
+    fixed_cost: 563
+    per_km_cost: 13.16
+    round_trip_km_limit: 600
+
+max_intermediate_stops_per_type: 4  # C4, applies to all types

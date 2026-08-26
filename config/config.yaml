@@ -1,0 +1,38 @@
+# Global config for the line-haul optimization pipeline
+
+planning_horizon:
+  start_date: "2026-07-01"
+  end_date: "2026-07-31"
+  n_days: 31
+
+paths:
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"
+  output_dir: "outputs/reports"
+  log_dir: "outputs/logs"
+
+  demand_file: "monthly_clustered_loads_combined.csv"
+  node_file: "node_processing_120.csv"
+  distance_file: "one_to_all_distance_matrix_full.csv"
+  vehicle_file: "vehicle_data_full.csv"
+  hop_cost_file: "B2B Loader CPK Working March-26.csv"
+  one_way_lane_file: "one_way_lane.xlsx"
+
+hard_constraints:
+  max_intermediate_stops: 4          # C4
+  spillover_limit_pct: 0.12          # C9, applies separately to phy_wt and vol_wt
+  # C3 round-trip km limits and C8 detour factors are per-vehicle/per-OD; sourced from data files
+
+soft_targets:
+  max_weighted_hops_per_kg: 0.2      # S1
+  max_weighted_avg_distance_per_kg_km: 1300  # S2
+  single_path_per_hub_pair: true     # S3
+
+cost:
+  touch_cost_factor: 0.5   # touch cost = 0.5 * hop cost (Section 2, component 4)
+
+solver:
+  # fill in once optimizer.py picks an approach (MILP / heuristic / column generation)
+  method: "tbd"
+  time_limit_sec: 3600
+  seed: 42
