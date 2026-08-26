@@ -5,3 +5,4 @@ openpyxl
 pulp
 matplotlib
 pytest
+gurobipy
