@@ -40,6 +40,8 @@ result = milp.build_and_solve(
     tables['distances'], tables['nodes'],
     limit_pct=cfg['hard_constraints']['spillover_limit_pct'],
     time_limit_sec=TIME_LIMIT_SEC, mip_gap=MIP_GAP,
+    verbose=True,  # prints build-stage progress; set False to silence and
+                   # only see Gurobi's own solve log
 )
 elapsed = time.time() - start
 

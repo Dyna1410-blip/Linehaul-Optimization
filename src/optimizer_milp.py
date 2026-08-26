@@ -68,9 +68,19 @@ import gurobipy as gp
 from gurobipy import GRB
 import sys
 import os
+import time
 
 sys.path.insert(0, os.path.dirname(__file__))
 import cost_model as cm
+
+
+def _progress(msg: str, start_time: float):
+    """Prints a timestamped progress line — model BUILDING is pure Python
+    with no built-in progress signal (unlike Gurobi's own solve log, which
+    already streams live). At real scale this build phase can itself take
+    a while, so this exists to make it visible rather than looking stuck."""
+    elapsed = time.time() - start_time
+    print(f"  [{elapsed:6.1f}s] {msg}", flush=True)
 
 
 def _precompute_path_metadata(candidate_paths_df: pd.DataFrame,
@@ -91,13 +101,17 @@ def _precompute_path_metadata(candidate_paths_df: pd.DataFrame,
 
 
 def _precompute_leg_trip_costs(legs: set, vehicle_df: pd.DataFrame,
-                                dist_df: pd.DataFrame, one_way_df: pd.DataFrame) -> dict:
+                                dist_df: pd.DataFrame, one_way_df: pd.DataFrame,
+                                start_time: float = None, verbose: bool = False) -> dict:
     dist_lookup = {
         (row.origin, row.destination): row.distance_km
         for row in dist_df.itertuples(index=False)
     }
     costs = {}
-    for (leg_from, leg_to) in legs:
+    n_legs = len(legs)
+    for idx, (leg_from, leg_to) in enumerate(legs):
+        if verbose and n_legs > 200 and idx % max(1, n_legs // 10) == 0:
+            _progress(f"leg trip costs: {idx}/{n_legs} legs", start_time)
         d = dist_lookup.get((leg_from, leg_to))
         if d is None:
             continue
@@ -112,11 +126,15 @@ def _precompute_leg_trip_costs(legs: set, vehicle_df: pd.DataFrame,
 
 
 def _precompute_through_trip_costs(paths: pd.DataFrame, vehicle_df: pd.DataFrame,
-                                    one_way_df: pd.DataFrame) -> dict:
+                                    one_way_df: pd.DataFrame,
+                                    start_time: float = None, verbose: bool = False) -> dict:
     """{(path_index, vehicle_type): trip_cost}, only for (path, vehicle)
     pairs whose FULL round-trip distance fits that vehicle's C3 limit."""
     costs = {}
-    for i, prow in paths.iterrows():
+    n_paths = len(paths)
+    for count, (i, prow) in enumerate(paths.iterrows()):
+        if verbose and n_paths > 500 and count % max(1, n_paths // 10) == 0:
+            _progress(f"through-route trip costs: {count}/{n_paths} paths", start_time)
         if not prow.has_intermediate:
             continue
         for v_row in vehicle_df.itertuples(index=False):
@@ -135,7 +153,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
                      node_df: pd.DataFrame, limit_pct: float = 0.12,
                      time_limit_sec: int = 600, mip_gap: float = 0.02,
                      touch_cost_factor: float = 0.5,
-                     spillage_penalty_per_kg: float = None) -> dict:
+                     spillage_penalty_per_kg: float = None,
+                     verbose: bool = True) -> dict:
     """
     spillage_penalty_per_kg: cost charged in the objective for every kg
     left unserved. WITHOUT this, spillage is "free" apart from the hard
@@ -150,7 +169,15 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
     model can still legally use up to the 12% cap when truly forced to by
     capacity).
     """
+    start_time = time.time()
+    if verbose:
+        _progress(f"starting build: {len(candidate_paths_df)} candidate paths, "
+                   f"{demand_df['date'].nunique()} days", start_time)
+
     paths = _precompute_path_metadata(candidate_paths_df, hop_cost_df, touch_cost_factor)
+    if verbose:
+        _progress(f"path metadata precomputed ({len(paths)} paths)", start_time)
+
     demand_df = demand_df.copy()
     demand_df["vol_density"] = (demand_df["vol_wt_kg"] / demand_df["phy_wt_kg"]).replace(
         [float("inf"), -float("inf")], 0
@@ -159,19 +186,35 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
     all_legs = set()
     for legs in paths["legs"]:
         all_legs.update(legs)
+    if verbose:
+        _progress(f"found {len(all_legs)} distinct legs across all paths", start_time)
 
-    leg_trip_costs = _precompute_leg_trip_costs(all_legs, vehicle_df, dist_df, one_way_df)
-    through_trip_costs = _precompute_through_trip_costs(paths, vehicle_df, one_way_df)
+    leg_trip_costs = _precompute_leg_trip_costs(all_legs, vehicle_df, dist_df, one_way_df,
+                                                 start_time, verbose)
+    if verbose:
+        _progress(f"leg trip costs computed ({len(leg_trip_costs)} leg-vehicle combos)", start_time)
+
+    through_trip_costs = _precompute_through_trip_costs(paths, vehicle_df, one_way_df,
+                                                          start_time, verbose)
+    if verbose:
+        _progress(f"through-route trip costs computed "
+                   f"({len(through_trip_costs)} path-vehicle combos)", start_time)
+
     vehicle_types = vehicle_df["vehicle_type"].tolist()
     days = sorted(demand_df["date"].unique())
 
     m_model = gp.Model("linehaul_milp_v2")
+    if not verbose:
+        m_model.setParam("OutputFlag", 0)
 
     # --- x[o,d,p]: split ratio (C6) ---
     path_idx = list(paths.index)
     x = m_model.addVars(path_idx, lb=0, ub=1, name="x")
     for (o, d), group in paths.groupby(["source_node", "dest_node"]):
         m_model.addConstr(gp.quicksum(x[i] for i in group.index) == 1, name=f"c6_{o}_{d}")
+    if verbose:
+        _progress(f"x[] split-ratio variables + C6 constraints added ({len(path_idx)} paths)",
+                   start_time)
 
     # --- served_leg / served_through ---
     demand_lookup = {
@@ -184,6 +227,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
             key = (prow.source_node, prow.dest_node, t)
             if key in demand_lookup:
                 served_keys.append((i, t))
+    if verbose:
+        _progress(f"served_keys built ({len(served_keys)} path-day combinations)", start_time)
 
     served_leg = m_model.addVars(served_keys, lb=0, name="served_leg")
     through_keys = [(i, t) for (i, t) in served_keys if paths.loc[i, "has_intermediate"]]
@@ -199,6 +244,9 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
             served_leg[i, t] + through_var(i, t) <= x[i] * phy_demand,
             name=f"cap_{i}_{t}",
         )
+    if verbose:
+        _progress(f"served_leg/served_through variables + capacity constraints added "
+                   f"({len(served_keys)} leg + {len(through_keys)} through)", start_time)
 
     # --- n[leg,t,v] (leg-based) and m[p,t,v] (through-route) ---
     valid_leg_vtypes = {(lf, lt): [] for (lf, lt) in all_legs}
@@ -227,6 +275,9 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
     m_veh = m_model.addVars(m_keys, vtype=GRB.INTEGER, lb=0, name="m")
 
     FS = m_model.addVars(vehicle_types, vtype=GRB.INTEGER, lb=0, name="fleet_size")
+    if verbose:
+        _progress(f"n[] and m[] dispatch variables added "
+                   f"({len(n_keys)} leg-dispatch + {len(m_keys)} through-dispatch)", start_time)
 
     # --- C7: shared fleet pool across BOTH dispatch types ---
     for v in vehicle_types:
@@ -240,6 +291,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
                 <= FS[v],
                 name=f"c7_{v}_{t}",
             )
+    if verbose:
+        _progress("C7 (fleet-sharing) constraints added", start_time)
 
     # --- C1: leg capacity — only served_leg flow draws on shared legs ---
     leg_flow_phy = {(lf, lt, t): [] for (lf, lt) in all_legs for t in days}
@@ -269,6 +322,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
             vol_capacity_expr = gp.quicksum(n[lf, lt, t, v] * vehicle_caps[v][1] for v in vtypes_here)
             vol_flow_expr = gp.quicksum(sv * density for sv, density in vol_terms)
             m_model.addConstr(vol_capacity_expr >= vol_flow_expr, name=f"c1vol_{lf}_{lt}_{t}")
+    if verbose:
+        _progress("C1 (leg capacity) constraints added", start_time)
 
     # --- through-route capacity: dedicated, per path (not shared) ---
     for i in valid_path_vtypes:
@@ -282,6 +337,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
             vol_cap_expr = gp.quicksum(m_veh[i, t, v] * vehicle_caps[v][1] for v in vtypes_here)
             m_model.addConstr(phy_cap_expr >= served_through[i, t], name=f"c1through_phy_{i}_{t}")
             m_model.addConstr(vol_cap_expr >= served_through[i, t] * vol_density, name=f"c1through_vol_{i}_{t}")
+    if verbose:
+        _progress("through-route capacity constraints added", start_time)
 
     # --- C2: node capacity ---
     # endpoints (source/dest of a path): ALL flow counts (leg + through)
@@ -308,6 +365,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
                     terms.append(served_leg[i, t])  # touch flow excluded here
             if terms:
                 m_model.addConstr(gp.quicksum(terms) <= cap, name=f"c2_{node}_{t}")
+    if verbose:
+        _progress("C2 (node capacity) constraints added", start_time)
 
     # --- C9: spillage ---
     # spill_phy[o,d,t] is an EXPLICIT variable (not just an implicit gap)
@@ -354,6 +413,8 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
     m_model.addConstr(
         total_vol - gp.quicksum(total_served_vol_terms) <= limit_pct * total_vol, name="c9_vol"
     )
+    if verbose:
+        _progress("C9 (spillage) variables + constraints added", start_time)
 
     # --- objective ---
     leg_cost_term = gp.quicksum(n[lf, lt, t, v] * leg_trip_costs[(lf, lt, v)] for (lf, lt, t, v) in n_keys)
@@ -375,6 +436,11 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
         leg_cost_term + through_cost_term + hop_cost_term + touch_cost_term + spillage_cost_term,
         GRB.MINIMIZE,
     )
+    if verbose:
+        m_model.update()  # NumVars/NumConstrs are lazy until update() or optimize()
+        _progress(f"objective set — model build complete "
+                   f"({m_model.NumVars} variables, {m_model.NumConstrs} constraints). "
+                   f"Handing off to Gurobi...", start_time)
 
     m_model.setParam("TimeLimit", time_limit_sec)
     m_model.setParam("MIPGap", mip_gap)
