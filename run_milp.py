@@ -29,7 +29,7 @@ print(f"  demand: {tables['demand'].shape}, candidate_paths: {candidate_paths.sh
 #      tables['demand'][tables['demand']['date'] <= '2026-07-07']
 #   3) Loosen mip_gap / lower time_limit_sec for a faster, good-enough answer.
 
-TIME_LIMIT_SEC = 600
+TIME_LIMIT_SEC = 16000  # 4.5 hours — leaves a buffer under your 5-hour ceiling
 MIP_GAP = 0.02
 
 print(f"Building and solving MILP (time_limit={TIME_LIMIT_SEC}s, mip_gap={MIP_GAP})...")
@@ -54,7 +54,9 @@ print()
 print("Fleet size:")
 print(result['fleet_size'])
 print()
-print(f"OD pairs with a routing plan: {result['chosen_paths']['source_node'].nunique() if not result['chosen_paths'].empty else 0}")
+n_od_pairs = (result['chosen_paths'][['source_node', 'dest_node']].drop_duplicates().shape[0]
+              if not result['chosen_paths'].empty else 0)
+print(f"OD pairs with a routing plan: {n_od_pairs}")
 print(f"Leg-based dispatch rows: {len(result['leg_dispatch'])}")
 print(f"Through-route dispatch rows: {len(result['through_dispatch'])}")
 if not result['served'].empty:
