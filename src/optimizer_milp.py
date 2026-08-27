@@ -230,8 +230,20 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
     if verbose:
         _progress(f"served_keys built ({len(served_keys)} path-day combinations)", start_time)
 
+    # PERFORMANCE FIX: served_keys/through_keys are checked with `in`
+    # repeatedly (thousands to hundreds-of-thousands of times) in the
+    # constraint-building loops below. As plain lists, each check scans
+    # the whole list — turning what should be O(1) lookups into O(n),
+    # and the surrounding loops into effectively O(n^2) or worse. At real
+    # scale (300K+ entries) this alone was responsible for build stages
+    # taking many minutes each instead of seconds. Sets fix this: `in` on
+    # a set is O(1) regardless of size. Iteration behavior (order aside,
+    # which nothing here depends on) and gurobipy's addVars are both
+    # unaffected by using a set instead of a list.
+    served_keys = set(served_keys)
+
     served_leg = m_model.addVars(served_keys, lb=0, name="served_leg")
-    through_keys = [(i, t) for (i, t) in served_keys if paths.loc[i, "has_intermediate"]]
+    through_keys = {(i, t) for (i, t) in served_keys if paths.loc[i, "has_intermediate"]}
     served_through = m_model.addVars(through_keys, lb=0, name="served_through")
 
     def through_var(i, t):
