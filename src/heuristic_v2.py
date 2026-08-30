@@ -215,7 +215,16 @@ def select_paths_v2(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
 def run_iterative_heuristic(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
                              vehicle_df: pd.DataFrame, hop_cost_df: pd.DataFrame,
                              one_way_df: pd.DataFrame, dist_df: pd.DataFrame,
-                             n_iterations: int = 4, verbose: bool = True) -> pd.DataFrame:
+                             n_iterations: int = 4, verbose: bool = True) -> tuple:
+    """Returns (chosen_paths_df, leg_vehicle_types) — the leg_vehicle_types
+    dict from the FINAL iteration must be passed into simulate_month_v2 too,
+    or leg-mode dispatches will silently fall back to a single default
+    type, defeating the whole point of the mixed-fleet selection done here.
+    (This was a real bug: leg-mode paths carry no per-leg vehicle_type in
+    chosen_paths_df itself — only through-mode paths do, since a leg-mode
+    path can use a DIFFERENT type on each of its legs, which doesn't fit
+    in one column. The dict has to travel alongside chosen_paths_df.)
+    """
     default_type = vehicle_df.loc[vehicle_df["phy_cap_kg"].idxmax(), "vehicle_type"]
 
     # pass 0: initial paths using default type everywhere
@@ -225,6 +234,7 @@ def run_iterative_heuristic(candidate_paths_df: pd.DataFrame, demand_df: pd.Data
     chosen["mode"] = "leg"
     chosen["vehicle_type"] = None
 
+    leg_vehicle_types = {}
     for it in range(n_iterations):
         leg_volumes_df = estimate_leg_daily_volume(chosen[["source_node", "dest_node", "path"]], demand_df)
         leg_volumes = {(r.leg_from, r.leg_to): r.avg_daily_phy_kg for r in leg_volumes_df.itertuples(index=False)}
@@ -239,7 +249,7 @@ def run_iterative_heuristic(candidate_paths_df: pd.DataFrame, demand_df: pd.Data
             print(f"  iteration {it+1}/{n_iterations}: estimated cost/kg-weighted total ~ {total_est_cost:,.0f}")
         chosen = new_chosen
 
-    return chosen
+    return chosen, leg_vehicle_types
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +258,8 @@ def run_iterative_heuristic(candidate_paths_df: pd.DataFrame, demand_df: pd.Data
 
 def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
                        vehicle_df: pd.DataFrame, hop_cost_df: pd.DataFrame,
-                       one_way_df: pd.DataFrame, dist_df: pd.DataFrame) -> dict:
+                       one_way_df: pd.DataFrame, dist_df: pd.DataFrame,
+                       leg_vehicle_types: dict = None) -> dict:
     """Real day-by-day simulation honoring each path's chosen mode
     (leg/through) and vehicle type, using the SAME tested bin-packing
     (fleet_assignment.pack_orders_into_vehicles) as the rest of the
@@ -256,10 +267,19 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
     Fleet size per type is set at PEAK daily need (see module docstring
     for why that's the correct, free choice given this cost structure).
 
+    leg_vehicle_types: the dict returned alongside chosen_paths_df by
+    run_iterative_heuristic(). REQUIRED for the mixed-fleet upgrade to
+    actually take effect — without it, every leg-mode dispatch silently
+    falls back to a single default (largest) vehicle type, since a
+    leg-mode path's per-leg types don't fit in chosen_paths_df's single
+    vehicle_type column (only through-mode paths use that column).
+
     Returns {"allocation": DataFrame, "vehicle_routes": DataFrame,
              "fleet_size": DataFrame, "total_cost": float,
              "cost_breakdown": {...}}
     """
+    if leg_vehicle_types is None:
+        leg_vehicle_types = {}
     dist_lookup = {(r.origin, r.destination): r.distance_km for r in dist_df.itertuples(index=False)}
     path_lookup = {
         (row.source_node, row.dest_node): row
@@ -288,9 +308,11 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
             else:
                 legs = list(zip(nodes[:-1], nodes[1:]))
                 for (lf, lt) in legs:
-                    v_type = getattr(prow, "vehicle_type", None)
-                    # leg-mode paths don't carry a per-path vehicle_type (that's
-                    # decided per-LEG, not per-path) — fall back to the largest type
+                    # FIX: use the actual per-leg vehicle type computed during
+                    # iterative selection, not a blanket fallback — this was
+                    # the mixed-fleet bug (every leg-mode dispatch silently
+                    # used the largest vehicle type regardless of leg volume).
+                    v_type = leg_vehicle_types.get((lf, lt))
                     if v_type is None:
                         v_type = vehicle_df.loc[vehicle_df["phy_cap_kg"].idxmax(), "vehicle_type"]
                     leg_groups.setdefault((lf, lt, v_type), []).append(order_dict)
@@ -368,4 +390,217 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
             "fixed": total_fixed, "per_km": total_per_km,
             "hop": total_hop, "touch": total_touch,
         },
+    }
+
+
+# ---------------------------------------------------------------------------
+# C2 (node capacity) enforcement via corrective re-routing
+# ---------------------------------------------------------------------------
+
+def find_node_capacity_violations(vehicle_routes_df: pd.DataFrame, node_df: pd.DataFrame) -> pd.DataFrame:
+    """Real check using constraints.py's checker — was never called during
+    construction (a known, now-confirmed-real gap: the heuristic ignores
+    C2 while building a solution). Returns one row per (node, date) that
+    exceeds capacity."""
+    import constraints as ct
+    cap_lookup = dict(zip(node_df["node"], node_df["processing_capacity_kg"]))
+    node_load = {}
+    for row in vehicle_routes_df.itertuples(index=False):
+        for node in (row.start_node, row.end_node):
+            key = (node, row.date)
+            node_load[key] = node_load.get(key, 0.0) + row.phy_load_kg
+
+    violations = []
+    for (node, date), load in node_load.items():
+        cap = cap_lookup.get(node)
+        if cap is None:
+            continue
+        result = ct.check_c2_node_capacity(load, cap)
+        if not result["pass"]:
+            violations.append({"node": node, "date": date, "load_kg": load,
+                                "capacity_kg": cap, "utilization": result["utilization"]})
+    return pd.DataFrame(violations)
+
+
+def resolve_node_capacity_violations(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
+                                      chosen_paths_df: pd.DataFrame, leg_vehicle_types: dict,
+                                      vehicle_df: pd.DataFrame, hop_cost_df: pd.DataFrame,
+                                      one_way_df: pd.DataFrame, dist_df: pd.DataFrame,
+                                      node_df: pd.DataFrame, max_rounds: int = 5,
+                                      verbose: bool = True) -> dict:
+    """Detects C2 violations and corrects them by re-routing contributing
+    ODs at each violated node to an alternate candidate path that avoids
+    all currently-known violated nodes — applied as a GLOBAL (whole-month)
+    path swap, not a single-day patch, since C6 requires a fixed path for
+    the whole horizon. Re-simulates and re-checks after each round.
+
+    IMPORTANT: swaps AS MANY contributors as needed per round to actually
+    clear the violated node's excess load, not just one. An earlier
+    version swapped only the single smallest contributor per round —
+    which barely dented an overloaded node's total load, so the violation
+    count stayed stuck across many rounds without ever clearing (caught
+    empirically: 6 swaps, violation count never dropped from 3).
+    Smallest-first ordering is kept (minimizes disruption to the
+    solution), but now continues swapping within the SAME round until the
+    excess (load - capacity) is actually covered.
+    """
+    chosen_paths_df = chosen_paths_df.copy()
+    n_swaps = 0
+
+    for round_num in range(max_rounds):
+        result = simulate_month_v2(demand_df, chosen_paths_df, vehicle_df, hop_cost_df,
+                                    one_way_df, dist_df, leg_vehicle_types)
+        violations = find_node_capacity_violations(result["vehicle_routes"], node_df)
+
+        if verbose:
+            print(f"  round {round_num + 1}/{max_rounds}: {len(violations)} node-day violations, "
+                  f"total_cost={result['total_cost']:,.0f}")
+
+        if violations.empty:
+            return {"chosen_paths": chosen_paths_df, "leg_vehicle_types": leg_vehicle_types,
+                    "result": result, "remaining_violations": violations, "n_swaps_made": n_swaps}
+
+        violated_nodes = set(violations["node"])
+        worst = violations.sort_values("utilization", ascending=False).iloc[0]
+        excess_kg = worst["load_kg"] - worst["capacity_kg"]
+
+        avg_weight = demand_df.groupby(["source_node", "dest_node"])["phy_wt_kg"].mean()
+        candidates_touching_node = []
+        for row in chosen_paths_df.itertuples(index=False):
+            nodes = row.path.split("|")
+            if worst["node"] in nodes:
+                w = avg_weight.get((row.source_node, row.dest_node), 0.0)
+                candidates_touching_node.append((w, row.source_node, row.dest_node))
+        candidates_touching_node.sort()  # smallest first — minimizes disruption
+
+        removed_kg = 0.0
+        swap_made_this_round = False
+
+        for w, o_node, d_node in candidates_touching_node:
+            if removed_kg >= excess_kg:
+                break  # cleared the excess already this round
+
+            alt_paths = candidate_paths_df[
+                (candidate_paths_df["source_node"] == o_node) &
+                (candidate_paths_df["dest_node"] == d_node)
+            ]
+            safe_alts = alt_paths[~alt_paths["path"].apply(
+                lambda p: any(n in p.split("|") for n in violated_nodes)
+            )]
+            if safe_alts.empty:
+                continue  # no safe alternative for this OD — skip, try the next contributor
+
+            best_alt = safe_alts.sort_values("total_distance_km").iloc[0]
+            mask = (chosen_paths_df["source_node"] == o_node) & (chosen_paths_df["dest_node"] == d_node)
+            chosen_paths_df.loc[mask, "path"] = best_alt["path"]
+            chosen_paths_df.loc[mask, "total_distance_km"] = best_alt["total_distance_km"]
+            chosen_paths_df.loc[mask, "mode"] = "leg"
+            chosen_paths_df.loc[mask, "vehicle_type"] = None
+            n_swaps += 1
+            swap_made_this_round = True
+            removed_kg += w
+            if verbose:
+                print(f"    swapped {o_node}->{d_node} ({w:,.0f} kg) off node {worst['node']} "
+                      f"to path {best_alt['path']} (removed {removed_kg:,.0f}/{excess_kg:,.0f} kg needed)")
+
+        if not swap_made_this_round:
+            if verbose:
+                print(f"    no safe alternative found for ANY contributor to node {worst['node']} — "
+                      f"cannot resolve this violation, stopping")
+            return {"chosen_paths": chosen_paths_df, "leg_vehicle_types": leg_vehicle_types,
+                    "result": result, "remaining_violations": violations, "n_swaps_made": n_swaps}
+
+        # recompute leg volumes/types after the swaps, since routing changed
+        leg_volumes_df = estimate_leg_daily_volume(
+            chosen_paths_df[["source_node", "dest_node", "path"]], demand_df
+        )
+        default_type = vehicle_df.loc[vehicle_df["phy_cap_kg"].idxmax(), "vehicle_type"]
+        leg_vehicle_types = choose_vehicle_types_per_leg(leg_volumes_df, dist_df, vehicle_df, default_type)
+
+    # ran out of rounds
+    result = simulate_month_v2(demand_df, chosen_paths_df, vehicle_df, hop_cost_df,
+                                one_way_df, dist_df, leg_vehicle_types)
+    violations = find_node_capacity_violations(result["vehicle_routes"], node_df)
+    return {"chosen_paths": chosen_paths_df, "leg_vehicle_types": leg_vehicle_types,
+            "result": result, "remaining_violations": violations, "n_swaps_made": n_swaps}
+
+
+# ---------------------------------------------------------------------------
+# Final fallback: spill just enough to clear violations that CANNOT be
+# rerouted (e.g. the violated node IS the shipment's own origin/destination,
+# not an avoidable intermediate hop — rerouting can never fix that; only
+# leaving some demand unserved can, within the 12% C9 allowance).
+# ---------------------------------------------------------------------------
+
+def spill_to_fit_remaining_violations(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
+                                       leg_vehicle_types: dict, vehicle_df: pd.DataFrame,
+                                       hop_cost_df: pd.DataFrame, one_way_df: pd.DataFrame,
+                                       dist_df: pd.DataFrame, node_df: pd.DataFrame,
+                                       remaining_violations: pd.DataFrame,
+                                       spillage_limit_pct: float = 0.12,
+                                       verbose: bool = True) -> dict:
+    """Last-resort fix for violations that resolve_node_capacity_violations
+    couldn't reroute away — reduces (spills) the smallest-weight orders
+    touching each still-violated (node, date) just enough to bring that
+    node under capacity that day, tracking total spillage explicitly and
+    checking it against the 12% cap (C9). This does NOT touch orders
+    unrelated to a violation — only the minimum needed, smallest-first.
+
+    Returns {"demand_df": adjusted copy, "result": final simulate_month_v2
+             output on the adjusted demand, "total_spilled_phy_kg": ...,
+             "spill_pct": ..., "within_c9_limit": bool}
+    """
+    demand_df = demand_df.copy()
+    total_original_phy = demand_df["phy_wt_kg"].sum()
+    total_spilled = 0.0
+
+    for viol in remaining_violations.itertuples(index=False):
+        excess = viol.load_kg - viol.capacity_kg
+        if excess <= 0:
+            continue
+
+        # which demand rows on this exact date have a chosen path touching this node?
+        day_demand = demand_df[demand_df["date"] == viol.date]
+        contributors = []
+        for row in day_demand.itertuples():
+            match = chosen_paths_df[
+                (chosen_paths_df["source_node"] == row.source_node) &
+                (chosen_paths_df["dest_node"] == row.dest_node)
+            ]
+            if match.empty:
+                continue
+            path_nodes = match.iloc[0]["path"].split("|")
+            if viol.node in path_nodes:
+                contributors.append((row.phy_wt_kg, row.Index))
+
+        contributors.sort()  # smallest first — minimizes how many orders are touched
+
+        removed = 0.0
+        for w, idx in contributors:
+            if removed >= excess:
+                break
+            spill_amount = min(w, excess - removed)
+            ratio = spill_amount / w if w > 0 else 0.0
+            demand_df.loc[idx, "phy_wt_kg"] -= spill_amount
+            demand_df.loc[idx, "vol_wt_kg"] -= demand_df.loc[idx, "vol_wt_kg"] * ratio
+            removed += spill_amount
+            total_spilled += spill_amount
+
+        if verbose:
+            print(f"  spilled {removed:,.0f}/{excess:,.0f} kg needed at {viol.node} on {viol.date.date()}")
+
+    result = simulate_month_v2(demand_df, chosen_paths_df, vehicle_df, hop_cost_df,
+                                one_way_df, dist_df, leg_vehicle_types)
+    spill_pct = total_spilled / total_original_phy if total_original_phy else 0.0
+
+    if verbose:
+        print(f"\nTotal spilled: {total_spilled:,.0f} kg ({spill_pct*100:.4f}% of total demand, "
+              f"limit is {spillage_limit_pct*100:.1f}%)")
+
+    return {
+        "demand_df": demand_df,
+        "result": result,
+        "total_spilled_phy_kg": total_spilled,
+        "spill_pct": spill_pct,
+        "within_c9_limit": spill_pct <= spillage_limit_pct,
     }

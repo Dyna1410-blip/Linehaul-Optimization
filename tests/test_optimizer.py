@@ -7,7 +7,7 @@ import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
 
 import pandas as pd
-from optimizer import (
+from optimizer_milp import (
     select_paths, simulate_day_with_capacity, simulate_month,
     size_fleet, run,
 )

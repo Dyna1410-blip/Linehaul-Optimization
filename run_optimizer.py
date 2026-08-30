@@ -7,7 +7,7 @@ sys.path.insert(0, 'src')
 
 import pandas as pd
 import data_loader as dl
-import optimizer as opt
+import optimizer_milp as opt
 
 print("Loading data...")
 cfg = dl.load_config('config/config.yaml')
