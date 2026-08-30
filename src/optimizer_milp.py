@@ -147,6 +147,77 @@ def _precompute_through_trip_costs(paths: pd.DataFrame, vehicle_df: pd.DataFrame
     return costs
 
 
+def _apply_warm_start(warm_start: dict, paths: pd.DataFrame, x, served_leg, served_through,
+                       through_keys, n, m_veh, FS, n_keys, m_keys, vehicle_types,
+                       start_time: float = None, verbose: bool = False):
+    """Sets Var.Start on every variable found in warm_start's DataFrames,
+    matched by semantic key (not raw index). Variables absent from
+    warm_start are left untouched (Gurobi's own start-completion heuristic
+    fills gaps in a partial MIP start, rather than assuming 0 — safer than
+    guessing when a previous solution simply doesn't cover a variable)."""
+    n_set = 0
+
+    # x[] from chosen_paths (split_ratio per source/dest/path)
+    if warm_start.get("chosen_paths") is not None and not warm_start["chosen_paths"].empty:
+        path_lookup = {
+            (row.source_node, row.dest_node, row.path): i
+            for i, row in paths.iterrows()
+        }
+        for row in warm_start["chosen_paths"].itertuples(index=False):
+            key = (row.source_node, row.dest_node, row.path)
+            if key in path_lookup:
+                x[path_lookup[key]].Start = row.split_ratio
+                n_set += 1
+
+    # served_leg[] / served_through[] from served
+    if warm_start.get("served") is not None and not warm_start["served"].empty:
+        path_lookup = {
+            (row.source_node, row.dest_node, row.path): i
+            for i, row in paths.iterrows()
+        }
+        for row in warm_start["served"].itertuples(index=False):
+            key = (row.source_node, row.dest_node, row.path)
+            i = path_lookup.get(key)
+            if i is None:
+                continue
+            if (i, row.date) in served_leg:
+                served_leg[i, row.date].Start = row.served_leg_kg
+                n_set += 1
+            if (i, row.date) in through_keys and (i, row.date) in served_through:
+                served_through[i, row.date].Start = row.served_through_kg
+                n_set += 1
+
+    # n[] from leg_dispatch
+    if warm_start.get("leg_dispatch") is not None and not warm_start["leg_dispatch"].empty:
+        for row in warm_start["leg_dispatch"].itertuples(index=False):
+            key = (row.leg_from, row.leg_to, row.date, row.vehicle_type)
+            if key in n:
+                n[key].Start = row.n_dispatched
+                n_set += 1
+
+    # m_veh[] from through_dispatch
+    if warm_start.get("through_dispatch") is not None and not warm_start["through_dispatch"].empty:
+        path_lookup = {row.path: i for i, row in paths.iterrows()}
+        for row in warm_start["through_dispatch"].itertuples(index=False):
+            i = path_lookup.get(row.path)
+            if i is None:
+                continue
+            key = (i, row.date, row.vehicle_type)
+            if key in m_veh:
+                m_veh[key].Start = row.n_dispatched
+                n_set += 1
+
+    # FS[] from fleet_size
+    if warm_start.get("fleet_size") is not None and not warm_start["fleet_size"].empty:
+        for row in warm_start["fleet_size"].itertuples(index=False):
+            if row.vehicle_type in vehicle_types:
+                FS[row.vehicle_type].Start = row.fleet_size
+                n_set += 1
+
+    if verbose:
+        _progress(f"warm start applied: {n_set} variable starting values set", start_time)
+
+
 def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
                      vehicle_df: pd.DataFrame, hop_cost_df: pd.DataFrame,
                      one_way_df: pd.DataFrame, dist_df: pd.DataFrame,
@@ -154,7 +225,12 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
                      time_limit_sec: int = 600, mip_gap: float = 0.02,
                      touch_cost_factor: float = 0.5,
                      spillage_penalty_per_kg: float = None,
-                     verbose: bool = True) -> dict:
+                     verbose: bool = True,
+                     warm_start: dict = None,
+                     root_method: int = None,
+                     cuts: int = None,
+                     cut_passes: int = None,
+                     mip_focus: int = None) -> dict:
     """
     spillage_penalty_per_kg: cost charged in the objective for every kg
     left unserved. WITHOUT this, spillage is "free" apart from the hard
@@ -168,6 +244,18 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
     enough to make spillage a last resort while still finite (so the
     model can still legally use up to the 12% cap when truly forced to by
     capacity).
+
+    warm_start: optional dict with the SAME shape as this function's return
+    value (chosen_paths, fleet_size, leg_dispatch, through_dispatch, served
+    DataFrames) — typically loaded from a previous run's saved CSVs. Sets
+    Gurobi's Var.Start on every matching variable, keyed by the same
+    semantic identifiers used throughout (path string, leg names, vehicle
+    type, date) rather than raw Gurobi/pandas indices — this stays correct
+    even if candidate_paths.csv gets re-read in a different row order
+    between runs. This does NOT literally resume the previous run's
+    branch-and-bound tree (that's gone once the process exits) — it gives
+    Gurobi a good starting incumbent so it can spend the new time budget
+    improving on it rather than re-discovering one from scratch.
     """
     start_time = time.time()
     if verbose:
@@ -456,6 +544,39 @@ def build_and_solve(candidate_paths_df: pd.DataFrame, demand_df: pd.DataFrame,
 
     m_model.setParam("TimeLimit", time_limit_sec)
     m_model.setParam("MIPGap", mip_gap)
+    if root_method is not None:
+        # Neither default simplex nor barrier (Method=2) fixed the "stuck
+        # at the root" problem on the real dataset — both got stuck in an
+        # expensive cutting-plane generation loop (thousands of MIR cuts)
+        # and never reached real branch-and-bound search ("Explored 1
+        # nodes" persisted either way). Kept as an option since it's
+        # harmless, but cuts/cut_passes/mip_focus below are the more
+        # promising levers for that specific symptom.
+        m_model.setParam("Method", root_method)
+    if cuts is not None:
+        # Limits cutting-plane AGGRESSIVENESS (0=off, 1=conservative,
+        # 2=aggressive, 3=very aggressive). Lower values mean Gurobi spends
+        # less time generating/re-solving-after cuts at the root and moves
+        # to branching sooner — trading a weaker bound for actual search
+        # progress, which is the direct fix for the "stuck at 1 node"
+        # symptom seen on the real dataset.
+        m_model.setParam("Cuts", cuts)
+    if cut_passes is not None:
+        # Hard cap on the NUMBER of cutting-plane rounds at the root,
+        # regardless of the Cuts aggressiveness setting above — a second,
+        # more direct way to force Gurobi out of the cut-generation loop
+        # and into branching after a bounded amount of root refinement.
+        m_model.setParam("CutPasses", cut_passes)
+    if mip_focus is not None:
+        # 1 = prioritize finding good feasible solutions over proving
+        # optimality — useful if a good-enough answer within the time
+        # budget matters more than a tight proven gap.
+        m_model.setParam("MIPFocus", mip_focus)
+
+    if warm_start is not None:
+        _apply_warm_start(warm_start, paths, x, served_leg, served_through, through_keys,
+                           n, m_veh, FS, n_keys, m_keys, vehicle_types, start_time, verbose)
+
     m_model.optimize()
 
     return _extract_solution(m_model, paths, n, m_veh, FS, x, served_leg, served_through,
