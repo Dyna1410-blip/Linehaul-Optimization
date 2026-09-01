@@ -156,65 +156,127 @@ def _apply_warm_start(warm_start: dict, paths: pd.DataFrame, x, served_leg, serv
     fills gaps in a partial MIP start, rather than assuming 0 — safer than
     guessing when a previous solution simply doesn't cover a variable)."""
     n_set = 0
+    n_set_by_category = {"x": 0, "served_leg": 0, "served_through": 0, "n": 0, "m": 0, "FS": 0}
+    n_attempted_by_category = {"x": 0, "served_leg": 0, "served_through": 0, "n": 0, "m": 0, "FS": 0}
 
-    # x[] from chosen_paths (split_ratio per source/dest/path)
+    # x[] from chosen_paths (split_ratio per source/dest/path) — set the
+    # chosen path's ratio, then EXPLICITLY zero every other candidate path
+    # for that OD (same "unset != 0" issue as n[]/m[] below — only ~552 of
+    # ~10,451 total x[] variables are ever nonzero, since each OD picks
+    # exactly one path; every other candidate path must be explicit 0).
     if warm_start.get("chosen_paths") is not None and not warm_start["chosen_paths"].empty:
         path_lookup = {
             (row.source_node, row.dest_node, row.path): i
             for i, row in paths.iterrows()
         }
+        matched_x_indices = set()
         for row in warm_start["chosen_paths"].itertuples(index=False):
             key = (row.source_node, row.dest_node, row.path)
+            n_attempted_by_category["x"] += 1
             if key in path_lookup:
-                x[path_lookup[key]].Start = row.split_ratio
+                idx = path_lookup[key]
+                x[idx].Start = row.split_ratio
                 n_set += 1
+                n_set_by_category["x"] += 1
+                matched_x_indices.add(idx)
+        for idx in paths.index:
+            if idx not in matched_x_indices:
+                x[idx].Start = 0
 
-    # served_leg[] / served_through[] from served
+    # served_leg[] / served_through[] from served — same explicit-zero
+    # treatment: only the CHOSEN path's (path,day) entries are nonzero,
+    # every other candidate path's served amount must be explicit 0.
     if warm_start.get("served") is not None and not warm_start["served"].empty:
         path_lookup = {
             (row.source_node, row.dest_node, row.path): i
             for i, row in paths.iterrows()
         }
+        matched_served_leg_keys = set()
+        matched_served_through_keys = set()
         for row in warm_start["served"].itertuples(index=False):
             key = (row.source_node, row.dest_node, row.path)
             i = path_lookup.get(key)
+            n_attempted_by_category["served_leg"] += 1
             if i is None:
                 continue
             if (i, row.date) in served_leg:
                 served_leg[i, row.date].Start = row.served_leg_kg
                 n_set += 1
+                n_set_by_category["served_leg"] += 1
+                matched_served_leg_keys.add((i, row.date))
             if (i, row.date) in through_keys and (i, row.date) in served_through:
+                n_attempted_by_category["served_through"] += 1
                 served_through[i, row.date].Start = row.served_through_kg
                 n_set += 1
+                n_set_by_category["served_through"] += 1
+                matched_served_through_keys.add((i, row.date))
+        for key in served_leg.keys():
+            if key not in matched_served_leg_keys:
+                served_leg[key].Start = 0
+        for key in through_keys:
+            if key in served_through and key not in matched_served_through_keys:
+                served_through[key].Start = 0
 
-    # n[] from leg_dispatch
+    # n[] from leg_dispatch — set matched entries, then EXPLICITLY zero every
+    # other n[] variable. Leaving unmatched integer variables unset (rather
+    # than 0) lets Gurobi's own completion heuristic invent values for them
+    # — and with only ~1% of n[]/m[] actually matched, it effectively
+    # invented a DIFFERENT dispatch pattern than the heuristic really used
+    # (confirmed: loaded objective was 697M, not the heuristic's real 434M,
+    # with a warning about "675660 unfixed non-continuous variables").
+    # Explicit zeroing forces an exact reconstruction instead.
     if warm_start.get("leg_dispatch") is not None and not warm_start["leg_dispatch"].empty:
+        matched_n_keys = set()
         for row in warm_start["leg_dispatch"].itertuples(index=False):
             key = (row.leg_from, row.leg_to, row.date, row.vehicle_type)
+            n_attempted_by_category["n"] += 1
             if key in n:
                 n[key].Start = row.n_dispatched
                 n_set += 1
+                n_set_by_category["n"] += 1
+                matched_n_keys.add(key)
+        for key in n_keys:
+            if key not in matched_n_keys:
+                n[key].Start = 0
 
-    # m_veh[] from through_dispatch
+    # m_veh[] from through_dispatch — same explicit-zero treatment
     if warm_start.get("through_dispatch") is not None and not warm_start["through_dispatch"].empty:
         path_lookup = {row.path: i for i, row in paths.iterrows()}
+        matched_m_keys = set()
         for row in warm_start["through_dispatch"].itertuples(index=False):
             i = path_lookup.get(row.path)
+            n_attempted_by_category["m"] += 1
             if i is None:
                 continue
             key = (i, row.date, row.vehicle_type)
             if key in m_veh:
                 m_veh[key].Start = row.n_dispatched
                 n_set += 1
+                n_set_by_category["m"] += 1
+                matched_m_keys.add(key)
+        for key in m_keys:
+            if key not in matched_m_keys:
+                m_veh[key].Start = 0
 
-    # FS[] from fleet_size
+    # FS[] from fleet_size — same treatment: vehicle types the heuristic
+    # never used at all (0 fleet needed) must be explicit 0, not left unset.
     if warm_start.get("fleet_size") is not None and not warm_start["fleet_size"].empty:
+        matched_fs_types = set()
         for row in warm_start["fleet_size"].itertuples(index=False):
+            n_attempted_by_category["FS"] += 1
             if row.vehicle_type in vehicle_types:
                 FS[row.vehicle_type].Start = row.fleet_size
                 n_set += 1
+                n_set_by_category["FS"] += 1
+                matched_fs_types.add(row.vehicle_type)
+        for v in vehicle_types:
+            if v not in matched_fs_types:
+                FS[v].Start = 0
 
     if verbose:
+        print(f"  warm start breakdown by category (matched/attempted):")
+        for cat in n_set_by_category:
+            print(f"    {cat}: {n_set_by_category[cat]}/{n_attempted_by_category[cat]}")
         _progress(f"warm start applied: {n_set} variable starting values set", start_time)
 
 

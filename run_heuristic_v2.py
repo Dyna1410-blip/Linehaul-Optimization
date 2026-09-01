@@ -99,6 +99,7 @@ print(f"Paths using leg-based (hop): {n_leg}")
 chosen_paths.to_csv('data/processed/heuristic_v2_chosen_paths.csv', index=False)
 result['allocation'].to_csv('data/processed/heuristic_v2_allocation.csv', index=False)
 result['vehicle_routes'].to_csv('data/processed/heuristic_v2_vehicle_routes.csv', index=False)
+result['served'].to_csv('data/processed/heuristic_v2_served.csv', index=False)
 result['fleet_size'].to_csv('data/processed/heuristic_v2_fleet_size.csv', index=False)
 print("\nSaved heuristic_v2_*.csv to data/processed/")
 

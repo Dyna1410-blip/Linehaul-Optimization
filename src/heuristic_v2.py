@@ -287,6 +287,7 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
     }
 
     allocation_rows, route_rows = [], []
+    served_rows = []  # (source_node, dest_node, path, date, served_leg_kg, served_through_kg)
     total_fixed = total_per_km = total_hop = total_touch = 0.0
     vehicle_counter = 0
 
@@ -302,7 +303,20 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
             order_id = f"{order.date.date()}_{order.source_node}_{order.dest_node}"
             order_dict = {"order_id": order_id, "phy_wt_kg": order.phy_wt_kg, "vol_wt_kg": order.vol_wt_kg}
 
-            if prow.mode == "through" and len(nodes) > 2:
+            # DIRECT served tracking — this is unambiguous right here (we
+            # know this order's true weight and its true mode), avoiding
+            # the need to reverse-engineer it later from saved CSVs via
+            # fragile string matching (which was a real, confirmed source
+            # of error in an earlier verification attempt).
+            is_through = prow.mode == "through" and len(nodes) > 2
+            served_rows.append({
+                "source_node": order.source_node, "dest_node": order.dest_node,
+                "path": prow.path, "date": date,
+                "served_leg_kg": 0.0 if is_through else order.phy_wt_kg,
+                "served_through_kg": order.phy_wt_kg if is_through else 0.0,
+            })
+
+            if is_through:
                 key = (prow.source_node, prow.dest_node, prow.path, prow.vehicle_type)
                 through_groups.setdefault(key, []).append(order_dict)
             else:
@@ -374,6 +388,7 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
 
     allocation_df = pd.DataFrame(allocation_rows)
     routes_df = pd.DataFrame(route_rows)
+    served_df = pd.DataFrame(served_rows)
 
     fleet_size = (routes_df.groupby(["date", "vehicle_type"]).size().reset_index(name="n")
                   .groupby("vehicle_type")["n"].max().reset_index().rename(columns={"n": "fleet_size"})
@@ -384,6 +399,7 @@ def simulate_month_v2(demand_df: pd.DataFrame, chosen_paths_df: pd.DataFrame,
     return {
         "allocation": allocation_df,
         "vehicle_routes": routes_df,
+        "served": served_df,
         "fleet_size": fleet_size,
         "total_cost": total_cost,
         "cost_breakdown": {
